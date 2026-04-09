@@ -7,6 +7,8 @@ import os
 import re
 import asyncio
 import logging
+import time
+import tempfile
 from typing import Optional
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
@@ -295,27 +297,39 @@ async def proxy_stream(
             loop = asyncio.get_event_loop()
             mp4_file = await loop.run_in_executor(
                 None,
-                lambda: download_hls_as_mp4(url)
+                download_hls_as_mp4,
+                url
             )
             
             if not mp4_file or not os.path.exists(mp4_file):
-                raise HTTPException(status_code=500, detail="Failed to convert HLS stream to mp4")
+                log.error(f"HLS conversion failed - file not found: {mp4_file}")
+                raise HTTPException(status_code=500, detail="Failed to convert HLS stream: file not created")
+            
+            file_size = os.path.getsize(mp4_file)
+            log.info(f"HLS conversion successful, file size: {file_size} bytes")
             
             # Stream the converted mp4 file
             async def file_generator():
                 try:
                     with open(mp4_file, "rb") as f:
+                        bytes_sent = 0
                         while True:
                             chunk = f.read(65536)
                             if not chunk:
                                 break
+                            bytes_sent += len(chunk)
                             yield chunk
+                        log.info(f"Successfully streamed {bytes_sent} bytes from converted mp4")
+                except Exception as e:
+                    log.error(f"Error streaming file: {e}")
+                    raise
                 finally:
                     # Clean up temp file after streaming
                     try:
                         os.remove(mp4_file)
-                    except:
-                        pass
+                        log.info(f"Cleaned up temp file: {mp4_file}")
+                    except Exception as e:
+                        log.warning(f"Failed to delete temp file: {e}")
             
             safe_filename = (
                 filename
@@ -329,6 +343,8 @@ async def proxy_stream(
             if not safe_filename.endswith(".mp4"):
                 safe_filename = safe_filename + ".mp4"
             
+            log.info(f"Streaming converted mp4 as: {safe_filename}")
+            
             return StreamingResponse(
                 file_generator(),
                 media_type="video/mp4",
@@ -336,9 +352,11 @@ async def proxy_stream(
                     "Content-Disposition": f'attachment; filename="{safe_filename}"',
                 },
             )
+        except HTTPException:
+            raise
         except Exception as e:
-            log.exception(f"Error converting m3u8 to mp4: {e}")
-            raise HTTPException(status_code=500, detail="Failed to download and convert HLS stream")
+            log.error(f"Error in m3u8 conversion: {type(e).__name__}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to convert HLS stream: {str(e)[:100]}")
     
     # For non-m3u8 URLs, use direct streaming
     headers = {
@@ -395,17 +413,19 @@ async def proxy_stream(
 
 def download_hls_as_mp4(url: str) -> str:
     """Download HLS/m3u8 stream and convert to mp4 using yt-dlp."""
-    import tempfile
-    
     temp_dir = tempfile.gettempdir()
-    output_path = os.path.join(temp_dir, f"xdl_{int(asyncio.get_event_loop().time())}.mp4")
+    timestamp = int(time.time() * 1000)  # Use milliseconds for uniqueness
+    temp_filename = os.path.join(temp_dir, f"xdl_{timestamp}.mp4")
+    
+    # yt-dlp requires the template WITHOUT the extension - it adds it
+    output_template = temp_filename.replace(".mp4", "")
     
     opts = {
         "format": "best",
         "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "outtmpl": output_path.replace(".mp4", ""),
+        "quiet": False,  # Set to False to see errors
+        "no_warnings": False,
+        "outtmpl": output_template,
         "postprocessors": [
             {
                 "key": "FFmpegVideoConvertor",
@@ -415,9 +435,17 @@ def download_hls_as_mp4(url: str) -> str:
     }
     
     try:
+        log.info(f"Downloading HLS stream: {url}")
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        return output_path
+            info = ydl.download([url])
+        
+        # Check if the file was created
+        if os.path.exists(temp_filename):
+            log.info(f"Successfully created mp4 file: {temp_filename}")
+            return temp_filename
+        else:
+            log.error(f"HLS conversion failed - output file not created: {temp_filename}")
+            raise Exception("FFmpeg conversion did not produce output file")
     except Exception as e:
-        log.error(f"Error downloading HLS stream: {e}")
+        log.error(f"Error downloading HLS stream: {e}", exc_info=True)
         raise
