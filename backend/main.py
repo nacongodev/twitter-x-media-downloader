@@ -290,10 +290,11 @@ async def proxy_stream(
     
     # Check if this is an m3u8 (HLS) URL - needs special handling
     if url.endswith(".m3u8") or ".m3u8" in url:
-        log.info(f"Detected m3u8 playlist, downloading and converting to mp4: {url}")
+        log.info(f"Detected m3u8 playlist: {url}")
         
-        # Use yt-dlp to download and convert HLS stream
+        # Try to convert m3u8 to mp4, but fall back to direct m3u8 stream if it fails
         try:
+            log.info(f"Attempting to download and convert m3u8 to mp4")
             loop = asyncio.get_event_loop()
             mp4_file = await loop.run_in_executor(
                 None,
@@ -301,62 +302,99 @@ async def proxy_stream(
                 url
             )
             
-            if not mp4_file or not os.path.exists(mp4_file):
-                log.error(f"HLS conversion failed - file not found: {mp4_file}")
-                raise HTTPException(status_code=500, detail="Failed to convert HLS stream: file not created")
-            
-            file_size = os.path.getsize(mp4_file)
-            log.info(f"HLS conversion successful, file size: {file_size} bytes")
-            
-            # Stream the converted mp4 file
-            async def file_generator():
-                try:
-                    with open(mp4_file, "rb") as f:
-                        bytes_sent = 0
-                        while True:
-                            chunk = f.read(65536)
-                            if not chunk:
-                                break
-                            bytes_sent += len(chunk)
-                            yield chunk
-                        log.info(f"Successfully streamed {bytes_sent} bytes from converted mp4")
-                except Exception as e:
-                    log.error(f"Error streaming file: {e}")
-                    raise
-                finally:
-                    # Clean up temp file after streaming
+            if mp4_file and os.path.exists(mp4_file):
+                file_size = os.path.getsize(mp4_file)
+                log.info(f"HLS conversion successful, file size: {file_size} bytes")
+                
+                # Stream the converted mp4 file
+                async def file_generator():
                     try:
-                        os.remove(mp4_file)
-                        log.info(f"Cleaned up temp file: {mp4_file}")
+                        with open(mp4_file, "rb") as f:
+                            bytes_sent = 0
+                            while True:
+                                chunk = f.read(65536)
+                                if not chunk:
+                                    break
+                                bytes_sent += len(chunk)
+                                yield chunk
+                            log.info(f"Successfully streamed {bytes_sent} bytes from converted mp4")
                     except Exception as e:
-                        log.warning(f"Failed to delete temp file: {e}")
-            
-            safe_filename = (
-                filename
-                .replace("..", "")
-                .replace("/", "_")
-                .replace("\\", "_")
-                .replace('"', "_")
-                .replace("'", "_")
-                [:200]
-            )
-            if not safe_filename.endswith(".mp4"):
-                safe_filename = safe_filename + ".mp4"
-            
-            log.info(f"Streaming converted mp4 as: {safe_filename}")
-            
-            return StreamingResponse(
-                file_generator(),
-                media_type="video/mp4",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{safe_filename}"',
-                },
-            )
-        except HTTPException:
-            raise
+                        log.error(f"Error streaming file: {e}")
+                        raise
+                    finally:
+                        # Clean up temp file after streaming
+                        try:
+                            os.remove(mp4_file)
+                            log.info(f"Cleaned up temp file: {mp4_file}")
+                        except Exception as e:
+                            log.warning(f"Failed to delete temp file: {e}")
+                
+                safe_filename = (
+                    filename
+                    .replace("..", "")
+                    .replace("/", "_")
+                    .replace("\\", "_")
+                    .replace('"', "_")
+                    .replace("'", "_")
+                    [:200]
+                )
+                if not safe_filename.endswith(".mp4"):
+                    safe_filename = safe_filename + ".mp4"
+                
+                log.info(f"Streaming converted mp4 as: {safe_filename}")
+                
+                return StreamingResponse(
+                    file_generator(),
+                    media_type="video/mp4",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                    },
+                )
         except Exception as e:
-            log.error(f"Error in m3u8 conversion: {type(e).__name__}: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Failed to convert HLS stream: {str(e)[:100]}")
+            log.warning(f"HLS conversion failed: {type(e).__name__}: {e}, falling back to direct m3u8 stream")
+        
+        # Fallback: stream the m3u8 playlist directly
+        log.info(f"Streaming m3u8 playlist directly to browser")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://x.com/",
+            "Origin":  "https://x.com",
+        }
+        
+        async def m3u8_generator():
+            try:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+                    async with client.stream("GET", url, headers=headers) as resp:
+                        resp.raise_for_status()
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            yield chunk
+            except Exception as e:
+                log.error(f"Error streaming m3u8: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to fetch m3u8 playlist: {str(e)[:100]}")
+        
+        safe_filename = (
+            filename
+            .replace("..", "")
+            .replace("/", "_")
+            .replace("\\", "_")
+            .replace('"', "_")
+            .replace("'", "_")
+            [:200]
+        )
+        if not safe_filename.endswith(".m3u8"):
+            safe_filename = safe_filename + ".m3u8"
+        
+        return StreamingResponse(
+            m3u8_generator(),
+            media_type="application/vnd.apple.mpegurl",  # Proper MIME type for m3u8
+            headers={
+                "Content-Disposition": f'inline; filename="{safe_filename}"',  # Use inline so browser tries to play it
+            },
+        )
     
     # For non-m3u8 URLs, use direct streaming
     headers = {
