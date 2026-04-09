@@ -50,6 +50,87 @@ function injectStyles() {
       fill: currentColor;
       flex-shrink: 0;
     }
+    .xdl-modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+    }
+    .xdl-modal {
+      background: white;
+      border-radius: 16px;
+      padding: 24px;
+      max-width: 400px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      text-align: center;
+      animation: slideUp 0.3s ease-out;
+    }
+    @keyframes slideUp {
+      from { transform: translateY(20px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    .xdl-modal h3 {
+      margin: 0 0 16px 0;
+      font-size: 18px;
+      font-weight: 600;
+      color: #000;
+    }
+    .xdl-modal p {
+      margin: 0 0 20px 0;
+      font-size: 14px;
+      color: #666;
+    }
+    .xdl-modal-buttons {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+    }
+    .xdl-modal-btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .xdl-modal-btn-download {
+      background: #1a7a3a;
+      color: white;
+    }
+    .xdl-modal-btn-download:hover {
+      background: #15633f;
+      transform: scale(1.05);
+    }
+    .xdl-modal-btn-cancel {
+      background: #f0f0f0;
+      color: #000;
+    }
+    .xdl-modal-btn-cancel:hover {
+      background: #e0e0e0;
+    }
+    @media (prefers-color-scheme: dark) {
+      .xdl-modal {
+        background: #1a1a1a;
+        color: white;
+      }
+      .xdl-modal h3 {
+        color: white;
+      }
+      .xdl-modal p {
+        color: #aaa;
+      }
+      .xdl-modal-btn-cancel {
+        background: #333;
+        color: white;
+      }
+      .xdl-modal-btn-cancel:hover {
+        background: #444;
+      }
+    }
   `;
   document.head.appendChild(style);
 }
@@ -155,7 +236,10 @@ function startObserver() {
     for (const m of mutations) {
       if (m.addedNodes.length) { shouldScan = true; break; }
     }
-    if (shouldScan) scanAndInject();
+    if (shouldScan) {
+      scanAndInject();
+      detectVideoPlayback();  // Detect any new videos
+    }
   });
 
   observer.observe(document.body, {
@@ -164,8 +248,106 @@ function startObserver() {
   });
 }
 
+// ── Video Play Detection ──────────────────────────────────────────────────────
+
+function getTweetUrlFromVideo(videoElement) {
+  // Find the closest tweet article containing this video
+  const article = videoElement.closest(TWEET_ARTICLE);
+  if (article) return getTweetUrl(article);
+  return null;
+}
+
+function showDownloadPrompt(tweetUrl, mediaTitle = "this media") {
+  // Create modal overlay
+  const overlay = document.createElement("div");
+  overlay.className = "xdl-modal-overlay";
+
+  const modal = document.createElement("div");
+  modal.className = "xdl-modal";
+  modal.innerHTML = `
+    <h3>Download Media?</h3>
+    <p>A video is playing. Would you like to download ${mediaTitle}?</p>
+    <div class="xdl-modal-buttons">
+      <button class="xdl-modal-btn xdl-modal-btn-download" id="xdl-download-yes">Download</button>
+      <button class="xdl-modal-btn xdl-modal-btn-cancel" id="xdl-download-no">Cancel</button>
+    </div>
+  `;
+
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  // Event listeners
+  const downloadBtn = modal.querySelector("#xdl-download-yes");
+  const cancelBtn = modal.querySelector("#xdl-download-no");
+
+  const closeModal = () => overlay.remove();
+
+  cancelBtn.addEventListener("click", closeModal);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeModal();
+  });
+
+  downloadBtn.addEventListener("click", async () => {
+    downloadBtn.disabled = true;
+    downloadBtn.textContent = "Downloading…";
+
+    chrome.runtime.sendMessage(
+      { type: "DOWNLOAD", url: tweetUrl },
+      (res) => {
+        if (res?.success) {
+          downloadBtn.textContent = "✓ Downloaded";
+          downloadBtn.style.background = "#1a7a3a";
+          setTimeout(closeModal, 2000);
+        } else {
+          downloadBtn.textContent = "Failed";
+          downloadBtn.style.background = "#a32d2d";
+          setTimeout(closeModal, 2000);
+        }
+      }
+    );
+  });
+}
+
+function detectVideoPlayback() {
+  // Watch for video/media elements that are playing
+  const videos = document.querySelectorAll('video, [data-testid="videoPlayer"], [data-testid="videoComponent"]');
+  
+  videos.forEach((video) => {
+    // Skip if already monitoring
+    if (video.getAttribute("data-xdl-monitored")) return;
+    video.setAttribute("data-xdl-monitored", "true");
+
+    // Detect play events
+    const playHandler = () => {
+      const tweetUrl = getTweetUrlFromVideo(video);
+      if (tweetUrl) {
+        showDownloadPrompt(tweetUrl, "this video");
+        // Remove this listener so it doesn't spam
+        video.removeEventListener("play", playHandler);
+      }
+    };
+
+    // For actual <video> elements
+    if (video.tagName === "VIDEO") {
+      video.addEventListener("play", playHandler);
+    } else {
+      // For custom X video players, detect fullscreen or play button clicks
+      const playButton = video.querySelector('[aria-label*="Play"], [role="button"]');
+      if (playButton) {
+        playButton.addEventListener("click", () => {
+          setTimeout(() => {
+            const tweetUrl = getTweetUrlFromVideo(video);
+            if (tweetUrl) showDownloadPrompt(tweetUrl, "this video");
+          }, 500);
+        });
+      }
+    }
+  });
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 
 injectStyles();
 scanAndInject();
+detectVideoPlayback();  // Initial scan for videos
 startObserver();
