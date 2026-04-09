@@ -3,7 +3,8 @@ cd backend
 # Activate virtual environment if it exists
 if [ -f /opt/venv/bin/activate ]; then
     source /opt/venv/bin/activate
+    exec python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+else
+    # Fallback: try direct python path
+    exec /opt/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port $PORT
 fi
-# Default PORT to 8000 if not set
-PORT=${PORT:-8000}
-exec python3 -m uvicorn main:app --host 0.0.0.0 --port $PORT
