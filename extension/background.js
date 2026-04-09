@@ -54,8 +54,11 @@ async function extractAndDownload(tweetUrl, overrides = {}) {
 
     let downloadUrl = item.direct_url;
 
-    // If proxy mode enabled, route through /proxy-stream
-    if (settings.useProxy) {
+    // Auto-detect if URL is m3u8 (HLS playlist) - these MUST go through proxy-stream
+    const isM3U8 = item.direct_url.includes(".m3u8");
+    
+    // If proxy mode enabled OR if it's an m3u8 URL, route through /proxy-stream
+    if (settings.useProxy || isM3U8) {
       downloadUrl = `${apiBase}/proxy-stream?url=${encodeURIComponent(item.direct_url)}&filename=${encodeURIComponent(filename)}`;
     }
 

@@ -126,6 +126,14 @@ def get_ydl_opts(quality: str = "best", fmt: str = "mp4") -> dict:
         "merge_output_format": fmt,
         "quiet":               True,
         "no_warnings":         True,
+        "allow_unplayable_formats": True,
+        # FFmpeg postprocessor to convert any format to mp4
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": fmt,  # Convert to mp4/mkv/webm
+            }
+        ],
     }
     if os.path.exists(COOKIE_PATH):
         opts["cookiefile"] = COOKIE_PATH
@@ -158,6 +166,11 @@ def _sync_extract(tweet_url: str, quality: str, fmt: str) -> list[MediaInfo]:
                 best = f
 
         direct = (best or {}).get("url") or entry.get("url") or ""
+        
+        # If the URL is m3u8 (HLS playlist), it needs to be downloaded via proxy-stream
+        # The extension will automatically use proxy mode for m3u8 URLs
+        is_m3u8 = direct.endswith(".m3u8") or ".m3u8" in direct
+        
         results.append(MediaInfo(
             title=entry.get("title") or entry.get("id") or "media",
             ext=entry.get("ext") or fmt,
@@ -258,13 +271,13 @@ async def list_formats(
 
 @app.get("/proxy-stream", tags=["media"])
 async def proxy_stream(
-    url: str      = Query(..., description="Direct CDN stream URL"),
+    url: str      = Query(..., description="Direct CDN stream URL or m3u8 playlist"),
     filename: str = Query("media.mp4", max_length=200, description="Download filename"),
 ):
     """
     Proxy the raw video stream through Railway.
     Used when CDN URLs have CORS restrictions that block the extension.
-    The extension calls this endpoint; Railway fetches and pipes the bytes.
+    Also handles HLS (m3u8) streams by downloading and converting to mp4.
     
     Security: Only allows streaming from whitelisted CDN domains to prevent SSRF attacks.
     """
@@ -273,6 +286,61 @@ async def proxy_stream(
         log.warning(f"Blocked proxy-stream attempt to unsafe domain: {url}")
         raise HTTPException(status_code=403, detail="CDN domain not allowed")
     
+    # Check if this is an m3u8 (HLS) URL - needs special handling
+    if url.endswith(".m3u8") or ".m3u8" in url:
+        log.info(f"Detected m3u8 playlist, downloading and converting to mp4: {url}")
+        
+        # Use yt-dlp to download and convert HLS stream
+        try:
+            loop = asyncio.get_event_loop()
+            mp4_file = await loop.run_in_executor(
+                None,
+                lambda: download_hls_as_mp4(url)
+            )
+            
+            if not mp4_file or not os.path.exists(mp4_file):
+                raise HTTPException(status_code=500, detail="Failed to convert HLS stream to mp4")
+            
+            # Stream the converted mp4 file
+            async def file_generator():
+                try:
+                    with open(mp4_file, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            yield chunk
+                finally:
+                    # Clean up temp file after streaming
+                    try:
+                        os.remove(mp4_file)
+                    except:
+                        pass
+            
+            safe_filename = (
+                filename
+                .replace("..", "")
+                .replace("/", "_")
+                .replace("\\", "_")
+                .replace('"', "_")
+                .replace("'", "_")
+                [:200]
+            )
+            if not safe_filename.endswith(".mp4"):
+                safe_filename = safe_filename + ".mp4"
+            
+            return StreamingResponse(
+                file_generator(),
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                },
+            )
+        except Exception as e:
+            log.exception(f"Error converting m3u8 to mp4: {e}")
+            raise HTTPException(status_code=500, detail="Failed to download and convert HLS stream")
+    
+    # For non-m3u8 URLs, use direct streaming
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -323,3 +391,33 @@ async def proxy_stream(
             "Content-Disposition": f'attachment; filename="{safe_filename}"',
         },
     )
+
+
+def download_hls_as_mp4(url: str) -> str:
+    """Download HLS/m3u8 stream and convert to mp4 using yt-dlp."""
+    import tempfile
+    
+    temp_dir = tempfile.gettempdir()
+    output_path = os.path.join(temp_dir, f"xdl_{int(asyncio.get_event_loop().time())}.mp4")
+    
+    opts = {
+        "format": "best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": output_path.replace(".mp4", ""),
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        return output_path
+    except Exception as e:
+        log.error(f"Error downloading HLS stream: {e}")
+        raise
