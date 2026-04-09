@@ -246,8 +246,17 @@ chrome.contextMenus?.onClicked.addListener(async (info, tab) => {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function sanitiseFilename(name) {
-  return name
-    .replace(/[\\/:*?"<>|]/g, "_")
-    .replace(/\s+/g, "_")
+  // Remove emoji and unicode special characters, keep only ASCII letters, numbers, and basic symbols
+  let clean = name
+    // Remove emoji and special unicode characters
+    .replace(/[\u00A0-\u9999<>:"/\\|?*\u2000-\u200D\uFEFF]/g, "_")
+    // Remove multiple underscores
+    .replace(/_+/g, "_")
+    // Remove leading/trailing underscores and dots
+    .replace(/^_+|_+$/g, "")
+    // Remove common unwanted extensions that might be embedded
+    .replace(/\.(json|unknown|tmp|temp)$/i, "")
     .substring(0, 200);
+  
+  return clean || "media";  // Fallback if everything got stripped
 }

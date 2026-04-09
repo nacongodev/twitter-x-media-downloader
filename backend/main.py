@@ -122,6 +122,24 @@ def is_safe_cdn_url(url: str) -> bool:
         return False
 
 
+def sanitize_filename(name: str) -> str:
+    """Sanitize filename: remove dangerous/unwanted chars, emoji, and bad extensions."""
+    import unicodedata
+    
+    # Remove emoji and unicode special characters, keep only ASCII alphanumeric and basic symbols
+    clean = re.sub(r'[\u00A0-\u9999\u2000-\u200D\uFEFF<>:"/\\|?*]', '_', name)
+    # Remove multiple underscores
+    clean = re.sub(r'_+', '_', clean)
+    # Remove leading/trailing underscores and dots
+    clean = re.sub(r'^_+|_+$', '', clean)
+    # Remove unwanted file extensions that might be embedded in the name
+    clean = re.sub(r'\.(json|unknown|tmp|temp|error)$', '', clean, flags=re.IGNORECASE)
+    # Limit length
+    clean = clean[:200]
+    
+    return clean or "media"
+
+
 def get_ydl_opts(quality: str = "best", fmt: str = "mp4") -> dict:
     opts = {
         "format":              QUALITY_MAP.get(quality, QUALITY_MAP["best"]),
@@ -173,9 +191,15 @@ def _sync_extract(tweet_url: str, quality: str, fmt: str) -> list[MediaInfo]:
         # The extension will automatically use proxy mode for m3u8 URLs
         is_m3u8 = direct.endswith(".m3u8") or ".m3u8" in direct
         
+        # Validate ext - if it's "json" or unknown, use the format parameter instead
+        ext = entry.get("ext") or fmt
+        valid_extensions = {"mp4", "mkv", "webm", "m3u8", "ts", "flv"}
+        if ext not in valid_extensions:
+            ext = fmt  # Fall back to requested format if ext is unknown
+        
         results.append(MediaInfo(
             title=entry.get("title") or entry.get("id") or "media",
-            ext=entry.get("ext") or fmt,
+            ext=ext,
             filesize=(best or {}).get("filesize"),
             thumbnail=entry.get("thumbnail"),
             duration=entry.get("duration"),
@@ -329,15 +353,7 @@ async def proxy_stream(
                         except Exception as e:
                             log.warning(f"Failed to delete temp file: {e}")
                 
-                safe_filename = (
-                    filename
-                    .replace("..", "")
-                    .replace("/", "_")
-                    .replace("\\", "_")
-                    .replace('"', "_")
-                    .replace("'", "_")
-                    [:200]
-                )
+                safe_filename = sanitize_filename(filename)
                 if not safe_filename.endswith(".mp4"):
                     safe_filename = safe_filename + ".mp4"
                 
@@ -376,15 +392,7 @@ async def proxy_stream(
                 log.error(f"Error streaming m3u8: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to fetch m3u8 playlist: {str(e)[:100]}")
         
-        safe_filename = (
-            filename
-            .replace("..", "")
-            .replace("/", "_")
-            .replace("\\", "_")
-            .replace('"', "_")
-            .replace("'", "_")
-            [:200]
-        )
+        safe_filename = sanitize_filename(filename)
         if not safe_filename.endswith(".m3u8"):
             safe_filename = safe_filename + ".m3u8"
         
@@ -430,15 +438,7 @@ async def proxy_stream(
                     yield chunk
 
     # Sanitize filename to prevent path traversal
-    safe_filename = (
-        filename
-        .replace("..", "")
-        .replace("/", "_")
-        .replace("\\", "_")
-        .replace('"', "_")
-        .replace("'", "_")
-        [:200]  # Max length
-    )
+    safe_filename = sanitize_filename(filename)
     
     return StreamingResponse(
         stream_generator(),
