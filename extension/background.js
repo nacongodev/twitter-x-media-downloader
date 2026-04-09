@@ -4,7 +4,7 @@
  * Makes API calls to Railway backend, triggers chrome.downloads.
  */
 
-const DEFAULT_API = "https://YOUR-APP.railway.app";  // replaced by user in settings
+const DEFAULT_API = "https://twitter-x-media-downloader-production.up.railway.app";  // replaced by user in settings
 
 // ── Storage helpers ────────────────────────────────────────────────────────
 
