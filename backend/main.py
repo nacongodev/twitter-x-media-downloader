@@ -35,8 +35,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Restricted CORS for security
-if os.getenv("ENV") == "production":
+# Default to OPEN for development (extension testing), RESTRICTED for production
+is_production = os.getenv("ENV") == "production"
+
+if is_production:
     cors_origins = [
         "https://x.com",
         "https://twitter.com",
@@ -44,7 +46,11 @@ if os.getenv("ENV") == "production":
         "https://www.twitter.com",
     ]
 else:
-    cors_origins = ["*"]
+    # Development: Allow all + extension (for unpacked extension testing)
+    cors_origins = [
+        "*",
+        "chrome-extension://*",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
