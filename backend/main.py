@@ -124,8 +124,6 @@ def is_safe_cdn_url(url: str) -> bool:
 
 def sanitize_filename(name: str) -> str:
     """Sanitize filename: remove dangerous/unwanted chars, emoji, and bad extensions."""
-    import unicodedata
-    
     # Remove emoji and unicode special characters, keep only ASCII alphanumeric and basic symbols
     clean = re.sub(r'[\u00A0-\u9999\u2000-\u200D\uFEFF<>:"/\\|?*]', '_', name)
     # Remove multiple underscores
@@ -307,6 +305,9 @@ async def proxy_stream(
     
     Security: Only allows streaming from whitelisted CDN domains to prevent SSRF attacks.
     """
+    # Sanitize filename IMMEDIATELY to prevent unicode encoding errors in headers
+    filename = sanitize_filename(filename)
+    
     # Validate URL is from safe CDN
     if not is_safe_cdn_url(url):
         log.warning(f"Blocked proxy-stream attempt to unsafe domain: {url}")
@@ -353,7 +354,7 @@ async def proxy_stream(
                         except Exception as e:
                             log.warning(f"Failed to delete temp file: {e}")
                 
-                safe_filename = sanitize_filename(filename)
+                safe_filename = filename
                 if not safe_filename.endswith(".mp4"):
                     safe_filename = safe_filename + ".mp4"
                 
@@ -392,7 +393,7 @@ async def proxy_stream(
                 log.error(f"Error streaming m3u8: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to fetch m3u8 playlist: {str(e)[:100]}")
         
-        safe_filename = sanitize_filename(filename)
+        safe_filename = filename
         if not safe_filename.endswith(".m3u8"):
             safe_filename = safe_filename + ".m3u8"
         
@@ -437,8 +438,8 @@ async def proxy_stream(
                         raise HTTPException(status_code=413, detail="Stream exceeded maximum size")
                     yield chunk
 
-    # Sanitize filename to prevent path traversal
-    safe_filename = sanitize_filename(filename)
+    # Use filename (already sanitized at function start)
+    safe_filename = filename
     
     return StreamingResponse(
         stream_generator(),
@@ -477,13 +478,19 @@ def download_hls_as_mp4(url: str) -> str:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.download([url])
         
-        # Check if the file was created
+        # Check if the file was created - try with and without .mp4 extension
+        # (yt-dlp may or may not add extension depending on whether conversion happened)
         if os.path.exists(temp_filename):
             log.info(f"Successfully created mp4 file: {temp_filename}")
             return temp_filename
+        elif os.path.exists(output_template):
+            # File was created without .mp4 extension - rename it
+            log.info(f"Found file at {output_template}, renaming to {temp_filename}")
+            os.rename(output_template, temp_filename)
+            return temp_filename
         else:
-            log.error(f"HLS conversion failed - output file not created: {temp_filename}")
-            raise Exception("FFmpeg conversion did not produce output file")
+            log.error(f"HLS download failed - output file not found at {temp_filename} or {output_template}")
+            raise Exception("HLS download did not produce output file")
     except Exception as e:
         log.error(f"Error downloading HLS stream: {e}", exc_info=True)
         raise
