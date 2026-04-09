@@ -9,6 +9,7 @@ import asyncio
 import logging
 from typing import Optional
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import yt_dlp
 import httpx
@@ -34,12 +35,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Restricted CORS for security
+if os.getenv("ENV") == "production":
+    cors_origins = [
+        "https://x.com",
+        "https://twitter.com",
+        "https://www.x.com",
+        "https://www.twitter.com",
+    ]
+else:
+    cors_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -79,6 +91,27 @@ QUALITY_MAP = {
 }
 
 COOKIE_PATH = "/app/cookies.txt"
+MAX_STREAM_SIZE = 5 * 1024 * 1024 * 1024  # 5GB limit per file
+
+# Allowed CDN domains for proxy-stream
+ALLOWED_DOMAINS = [
+    "twimg.com",
+    "pbs.twimg.com",
+    "video.twimg.com",
+    "twitter.com",
+    "x.com",
+]
+
+def is_safe_cdn_url(url: str) -> bool:
+    """Validate that URL is from an allowed CDN to prevent SSRF attacks."""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        # Remove port if present
+        domain = domain.split(':')[0]
+        return any(domain.endswith(d) for d in ALLOWED_DOMAINS)
+    except Exception:
+        return False
 
 
 def get_ydl_opts(quality: str = "best", fmt: str = "mp4") -> dict:
@@ -168,9 +201,9 @@ async def health():
 
 @app.get("/extract", response_model=ExtractResponse, tags=["media"])
 async def extract(
-    url: str   = Query(...,    description="Full X/Twitter post URL"),
-    quality: str = Query("best", description="best | 1080p | 720p | 480p | audio"),
-    fmt: str   = Query("mp4",  description="mp4 | mkv | webm"),
+    url: str   = Query(..., min_length=10, max_length=2000, description="Full X/Twitter post URL"),
+    quality: str = Query("best", regex="^(best|1080p|720p|480p|audio)$", description="best | 1080p | 720p | 480p | audio"),
+    fmt: str   = Query("mp4", regex="^(mp4|mkv|webm)$", description="mp4 | mkv | webm"),
 ):
     """
     Extract direct media stream URL(s) from an X post.
@@ -186,10 +219,11 @@ async def extract(
             None, _sync_extract, url, quality, fmt
         )
     except yt_dlp.utils.DownloadError as e:
-        return ExtractResponse(success=False, tweet_url=url, media=[], error=str(e))
+        log.warning(f"Download error for {url}: {e}")
+        return ExtractResponse(success=False, tweet_url=url, media=[], error="Unable to extract media from this post")
     except Exception as e:
-        log.exception("Extraction error")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.exception(f"Unexpected error extracting {url}")
+        return ExtractResponse(success=False, tweet_url=url, media=[], error="Internal server error")
 
     if not media_list:
         return ExtractResponse(
@@ -202,7 +236,7 @@ async def extract(
 
 @app.get("/formats", tags=["media"])
 async def list_formats(
-    url: str = Query(..., description="Full X/Twitter post URL"),
+    url: str = Query(..., min_length=10, max_length=2000, description="Full X/Twitter post URL"),
 ):
     """List every available format/resolution for a tweet."""
     if not TWITTER_RE.match(url):
@@ -211,20 +245,28 @@ async def list_formats(
         loop = asyncio.get_event_loop()
         formats = await loop.run_in_executor(None, _sync_list_formats, url)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log.exception(f"Error listing formats for {url}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve formats")
     return {"url": url, "formats": formats}
 
 
 @app.get("/proxy-stream", tags=["media"])
 async def proxy_stream(
-    url: str      = Query(...,          description="Direct CDN stream URL"),
-    filename: str = Query("media.mp4", description="Download filename"),
+    url: str      = Query(..., description="Direct CDN stream URL"),
+    filename: str = Query("media.mp4", max_length=200, description="Download filename"),
 ):
     """
     Proxy the raw video stream through Railway.
     Used when CDN URLs have CORS restrictions that block the extension.
     The extension calls this endpoint; Railway fetches and pipes the bytes.
+    
+    Security: Only allows streaming from whitelisted CDN domains to prevent SSRF attacks.
     """
+    # Validate URL is from safe CDN
+    if not is_safe_cdn_url(url):
+        log.warning(f"Blocked proxy-stream attempt to unsafe domain: {url}")
+        raise HTTPException(status_code=403, detail="CDN domain not allowed")
+    
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -236,18 +278,42 @@ async def proxy_stream(
     }
 
     async def stream_generator():
+        bytes_sent = 0
         async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
             async with client.stream("GET", url, headers=headers) as resp:
                 resp.raise_for_status()
+                # Check Content-Length header
+                content_length = resp.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > MAX_STREAM_SIZE:
+                            log.warning(f"Stream size {content_length} exceeds limit")
+                            raise HTTPException(status_code=413, detail="File too large")
+                    except ValueError:
+                        pass
+                
                 async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    bytes_sent += len(chunk)
+                    if bytes_sent > MAX_STREAM_SIZE:
+                        log.warning(f"Stream exceeded max size: {bytes_sent} bytes")
+                        raise HTTPException(status_code=413, detail="Stream exceeded maximum size")
                     yield chunk
 
-    safe_filename = filename.replace('"', '_')
+    # Sanitize filename to prevent path traversal
+    safe_filename = (
+        filename
+        .replace("..", "")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace('"', "_")
+        .replace("'", "_")
+        [:200]  # Max length
+    )
+    
     return StreamingResponse(
         stream_generator(),
         media_type="video/mp4",
         headers={
             "Content-Disposition": f'attachment; filename="{safe_filename}"',
-            "Access-Control-Allow-Origin": "*",
         },
     )

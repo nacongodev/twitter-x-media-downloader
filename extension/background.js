@@ -147,6 +147,29 @@ chrome.downloads.onChanged.addListener((delta) => {
   }
 });
 
+// ── Message handler for content script ──────────────────────────────────────
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "DOWNLOAD") {
+    extractAndDownload(message.url)
+      .then(sendResponse)
+      .catch(e => sendResponse({ success: false, error: e.message }));
+    return true;  // async response
+  }
+  if (message.type === "GET_SETTINGS") {
+    getSettings().then(sendResponse);
+    return true;
+  }
+  if (message.type === "SAVE_SETTINGS") {
+    chrome.storage.sync.set(message.settings, () => sendResponse({ saved: true }));
+    return true;
+  }
+  if (message.type === "HEALTH_CHECK") {
+    checkHealth().then(online => sendResponse({ online }));
+    return true;
+  }
+});
+
 
 // ── Message router ─────────────────────────────────────────────────────────
 
